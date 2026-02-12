@@ -30,6 +30,7 @@ TRANSIT_PASSPHRASE = "12345"
 
 MAILBOX_DIR = Path("server_mailboxes")
 KEYSTORE_FILE = Path("server_keystore.json")
+BANLIST_FILE = Path("banned_ips.txt")
 MAX_MSG_SIZE = 10_485_760  # 10 MB
 CHALLENGE_SIZE = 32
 
@@ -149,6 +150,21 @@ class ServerMailbox:
     def count(self, uid: str) -> int:
         d = self._user_dir(uid)
         return len(list(d.glob("*.json"))) if d.exists() else 0
+
+# ============================================================
+#  BAN LIST
+# ============================================================
+
+def is_banned(ip: str) -> bool:
+    """Check if an IP is banned. Re-reads file each time so bans
+    added via the admin tool take effect without a server restart."""
+    if not BANLIST_FILE.exists():
+        return False
+    try:
+        banned = set(line.strip() for line in BANLIST_FILE.read_text().splitlines() if line.strip())
+        return ip in banned
+    except Exception:
+        return False
 
 # ============================================================
 #  CLIENT HANDLER (Headless)
@@ -323,6 +339,10 @@ def main():
     try:
         while True:
             client_sock, addr = server_sock.accept()
+            if is_banned(addr[0]):
+                log(f"BLOCKED banned IP: {addr[0]}")
+                client_sock.close()
+                continue
             handler = ClientHandler(
                 client_sock, addr, master_key, mailbox, 
                 key_registry, clients, clients_lock, server_identity

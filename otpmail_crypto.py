@@ -650,6 +650,15 @@ class MessageStore:
             d['read'] = True
             self.vault.encrypt_and_store(filename, d)
 
+    def toggle_favourite(self, filename) -> bool:
+        """Toggle favourite flag. Returns the new state."""
+        d = self.vault.load_and_decrypt(filename)
+        if d:
+            d['favourite'] = not d.get('favourite', False)
+            self.vault.encrypt_and_store(filename, d)
+            return d['favourite']
+        return False
+
     def delete_message(self, filename):
         self.vault.delete_file(filename)
 
@@ -660,6 +669,9 @@ class MessageStore:
             for fn in self.vault.list_files(prefix):
                 d = self.vault.load_and_decrypt(fn)
                 if d:
+                    # Never purge favourited messages
+                    if d.get('favourite', False):
+                        continue
                     try:
                         if datetime.fromisoformat(d['timestamp']) < cutoff:
                             self.vault.delete_file(fn)
