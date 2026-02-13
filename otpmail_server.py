@@ -14,6 +14,7 @@ try:
     from otpmail_crypto import (
         derive_master_key, generate_session_salt, derive_session_key,
         aes_transit_encrypt, aes_transit_decrypt, KeyManager, ServerIdentity,
+        load_transit_key_from_file, generate_transit_key_file,
     )
 except ImportError:
     print("Error: 'otpmail_crypto.py' not found. Ensure it is in the same directory.")
@@ -25,9 +26,8 @@ except ImportError:
 
 HOST = "0.0.0.0"
 DEFAULT_PORT = 65432
-# Change this via environment variable or hardcode for your VPS
-TRANSIT_PASSPHRASE = "12345"
 
+TRANSIT_KEY_FILE = Path("transit_key.txt")
 MAILBOX_DIR = Path("server_mailboxes")
 KEYSTORE_FILE = Path("server_keystore.json")
 BANLIST_FILE = Path("banned_ips.txt")
@@ -314,10 +314,19 @@ class ClientHandler(threading.Thread):
 # ============================================================
 
 def main():
+    # Load or generate transit key
+    transit_key = load_transit_key_from_file(TRANSIT_KEY_FILE)
+    if not transit_key:
+        transit_key = generate_transit_key_file(TRANSIT_KEY_FILE)
+        log(f"Generated new transit key \u2192 {TRANSIT_KEY_FILE}")
+        log("Share this key with clients securely (in-person, your website, etc.)")
+    else:
+        log(f"Transit key loaded from {TRANSIT_KEY_FILE}")
+
     # Setup data structures
     mailbox = ServerMailbox(MAILBOX_DIR)
     key_registry = KeyRegistry(KEYSTORE_FILE)
-    master_key = derive_master_key(TRANSIT_PASSPHRASE)
+    master_key = derive_master_key(transit_key)
     server_identity = ServerIdentity(Path("."))
     clients = {}
     clients_lock = threading.Lock()
@@ -329,7 +338,7 @@ def main():
         server_sock.bind((HOST, DEFAULT_PORT))
         server_sock.listen(50)
         log(f"OTPMail Relay Server started on {HOST}:{DEFAULT_PORT}")
-        log(f"Transit key protection active. {len(key_registry.keys)} users registered.")
+        log(f"{len(key_registry.keys)} users registered.")
         log(f"Server public key: {server_identity.get_public_hex()}")
         log(f"Server fingerprint: {server_identity.get_fingerprint()}")
     except Exception as e:

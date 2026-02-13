@@ -89,6 +89,27 @@ def derive_master_key(passphrase: str) -> bytes:
     return kdf.derive(passphrase.encode('utf-8'))
 
 
+def load_transit_key_from_file(filepath) -> str:
+    """Read transit key from a file, skipping comment lines."""
+    p = Path(filepath)
+    if not p.exists():
+        return ""
+    lines = [l.strip() for l in p.read_text().splitlines()
+             if l.strip() and not l.strip().startswith('#')]
+    return lines[0] if lines else ""
+
+
+def generate_transit_key_file(filepath) -> str:
+    """Generate a cryptographically strong transit key and save it."""
+    key = secrets.token_hex(32)  # 64 hex chars = 256 bits
+    Path(filepath).write_text(
+        "# OTPMail Transit Key (auto-generated)\n"
+        "# Share this key with clients securely. Do NOT use a weak passphrase.\n"
+        f"{key}\n"
+    )
+    return key
+
+
 def generate_session_salt() -> bytes:
     """Generate a 16-byte random salt for a new session."""
     return secrets.token_bytes(16)
