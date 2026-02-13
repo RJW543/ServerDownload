@@ -110,23 +110,54 @@ def generate_transit_key_file(filepath) -> str:
     return key
 
 
+import re
+_USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
+
+def validate_username(username: str) -> bool:
+    """
+    Validate username to prevent directory traversal and other injection.
+    Allows letters, digits, underscore, hyphen. 1-32 characters.
+    Rejects: empty, dots, slashes, spaces, special chars.
+    """
+    return bool(_USERNAME_RE.match(username))
+
+
 def generate_session_salt() -> bytes:
     """Generate a 16-byte random salt for a new session."""
     return secrets.token_bytes(16)
 
 
-def derive_session_key(master_key: bytes, session_salt: bytes) -> bytes:
+def derive_session_key(master_key: bytes, session_salt: bytes,
+                       ecdh_secret: bytes = b"") -> bytes:
     """
     Derive unique session transit key from master key + random salt.
-    Uses HKDF (fast) since master key already has full entropy from PBKDF2.
+    When ecdh_secret is provided (from ephemeral ECDHE), it's mixed in
+    for forward secrecy — even if the transit key is later compromised,
+    past session keys cannot be reconstructed.
     """
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
         salt=session_salt,
-        info=b"OTPMail-SessionTransit-v2",
+        info=b"OTPMail-SessionTransit-v3",
     )
-    return hkdf.derive(master_key)
+    return hkdf.derive(master_key + ecdh_secret)
+
+
+def generate_ephemeral_x25519() -> Tuple[X25519PrivateKey, bytes]:
+    """Generate an ephemeral X25519 keypair for per-session forward secrecy.
+    Returns (private_key_object, raw_32_byte_public_key)."""
+    private = X25519PrivateKey.generate()
+    public = private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return private, public
+
+
+def compute_ecdh_secret(private_key: X25519PrivateKey,
+                        peer_public_bytes: bytes) -> bytes:
+    """Compute X25519 ECDH shared secret (32 bytes)."""
+    peer_public = X25519PublicKey.from_public_bytes(peer_public_bytes)
+    return private_key.exchange(peer_public)
 
 
 def aes_transit_encrypt(plaintext_bytes: bytes, session_key: bytes) -> bytes:
@@ -257,7 +288,8 @@ class ServerIdentity:
 
     On first run the server generates a keypair and saves it.
     During the handshake the server sends:
-        salt (16B) || server_ed25519_pub (32B) || signature(salt) (64B)
+        salt (16B) || server_ed25519_pub (32B) || server_eph_pub (32B)
+        || signature(salt || server_eph_pub) (64B) = 144 bytes
     The client verifies the signature and pins the public key via TOFU.
     """
 
@@ -298,16 +330,21 @@ class ServerIdentity:
         digest = hashlib.sha256(self.get_public_bytes()).hexdigest()
         return ':'.join(digest[i:i+4] for i in range(0, 32, 4))
 
+    def sign_data(self, data: bytes) -> bytes:
+        """Sign arbitrary data. Returns 64-byte Ed25519 signature."""
+        return self._private.sign(data)
+
+    # Keep backward-compatible alias
     def sign_salt(self, salt: bytes) -> bytes:
-        """Sign the session salt. Returns 64-byte Ed25519 signature."""
-        return self._private.sign(salt)
+        return self.sign_data(salt)
 
     @staticmethod
-    def verify_server_signature(server_pub_bytes: bytes, signature: bytes, salt: bytes) -> bool:
-        """Client-side: verify the server signed this salt."""
+    def verify_server_signature(server_pub_bytes: bytes, signature: bytes,
+                                data: bytes) -> bool:
+        """Client-side: verify the server signed this data."""
         try:
             pub = Ed25519PublicKey.from_public_bytes(server_pub_bytes)
-            pub.verify(signature, salt)
+            pub.verify(signature, data)
             return True
         except Exception:
             return False

@@ -15,6 +15,7 @@ try:
         derive_master_key, generate_session_salt, derive_session_key,
         aes_transit_encrypt, aes_transit_decrypt, KeyManager, ServerIdentity,
         load_transit_key_from_file, generate_transit_key_file,
+        generate_ephemeral_x25519, compute_ecdh_secret, validate_username,
     )
 except ImportError:
     print("Error: 'otpmail_crypto.py' not found. Ensure it is in the same directory.")
@@ -33,6 +34,10 @@ KEYSTORE_FILE = Path("server_keystore.json")
 BANLIST_FILE = Path("banned_ips.txt")
 MAX_MSG_SIZE = 10_485_760  # 10 MB
 CHALLENGE_SIZE = 32
+
+# Connection limits (DoS protection)
+MAX_CONNECTIONS = 50       # Total concurrent connections
+MAX_PER_IP = 3             # Max concurrent connections per IP
 
 # ============================================================
 #  LOGGING REPLACEMENT
@@ -171,7 +176,9 @@ def is_banned(ip: str) -> bool:
 # ============================================================
 
 class ClientHandler(threading.Thread):
-    def __init__(self, sock, addr, master_key, mailbox, key_registry, clients, clients_lock, server_identity):
+    def __init__(self, sock, addr, master_key, mailbox, key_registry,
+                 clients, clients_lock, server_identity,
+                 conn_semaphore, ip_counts, ip_lock):
         super().__init__(daemon=True)
         self.sock = sock
         self.addr = addr
@@ -181,6 +188,9 @@ class ClientHandler(threading.Thread):
         self.clients = clients
         self.clients_lock = clients_lock
         self.server_identity = server_identity
+        self.conn_semaphore = conn_semaphore
+        self.ip_counts = ip_counts
+        self.ip_lock = ip_lock
         self.user_id = None
         self.session_key = None
 
@@ -202,13 +212,25 @@ class ClientHandler(threading.Thread):
         return pt.decode('utf-8')
 
     def _handle_session(self):
-        # 1. Authenticated Salt Exchange
-        # Send: salt (16B) || server_pub (32B) || signature(salt) (64B) = 112 bytes
+        # 1. Ephemeral ECDHE + Authenticated Handshake
+        # Generate per-session ephemeral X25519 keypair (forward secrecy)
+        server_eph_priv, server_eph_pub = generate_ephemeral_x25519()
+
+        # Send: salt(16B) || id_pub(32B) || eph_pub(32B) || sig(salt||eph_pub)(64B) = 144 bytes
         session_salt = generate_session_salt()
-        server_pub = self.server_identity.get_public_bytes()
-        signature = self.server_identity.sign_salt(session_salt)
-        self.sock.sendall(session_salt + server_pub + signature)
-        self.session_key = derive_session_key(self.master_key, session_salt)
+        server_id_pub = self.server_identity.get_public_bytes()
+        signature = self.server_identity.sign_data(session_salt + server_eph_pub)
+        self.sock.sendall(session_salt + server_id_pub + server_eph_pub + signature)
+
+        # Receive client's ephemeral public key (32 bytes)
+        client_eph_pub = _recv_exact(self.sock, 32)
+
+        # Compute ECDH shared secret and derive session key
+        ecdh_secret = compute_ecdh_secret(server_eph_priv, client_eph_pub)
+        self.session_key = derive_session_key(self.master_key, session_salt, ecdh_secret)
+
+        # Ephemeral private key is now discarded (goes out of scope)
+        del server_eph_priv
 
         # 2. Auth
         msg = self._recv_encrypted()
@@ -217,6 +239,12 @@ class ClientHandler(threading.Thread):
         parts = msg.split("|")
         if len(parts) != 4: return
         _, username, ed25519_pub, x25519_pub = parts
+
+        # 2b. Username validation (prevents directory traversal)
+        if not validate_username(username):
+            self._send_encrypted("ERROR|Invalid username. Use letters, digits, _ or - only (1-32 chars).")
+            log(f"REJECTED invalid username: {repr(username)} from {self.addr[0]}")
+            return
 
         # 3. TOFU
         if self.key_registry.is_registered(username):
@@ -308,6 +336,13 @@ class ClientHandler(threading.Thread):
                     del self.clients[self.user_id]
             log(f"User '{self.user_id}' disconnected")
         self.sock.close()
+        # Release connection tracking
+        ip = self.addr[0]
+        with self.ip_lock:
+            self.ip_counts[ip] = self.ip_counts.get(ip, 1) - 1
+            if self.ip_counts[ip] <= 0:
+                del self.ip_counts[ip]
+        self.conn_semaphore.release()
 
 # ============================================================
 #  MAIN ENTRY POINT
@@ -331,6 +366,11 @@ def main():
     clients = {}
     clients_lock = threading.Lock()
 
+    # Connection limiting (DoS protection)
+    conn_semaphore = threading.Semaphore(MAX_CONNECTIONS)
+    ip_counts = {}   # {ip: current_connection_count}
+    ip_lock = threading.Lock()
+
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
@@ -338,6 +378,7 @@ def main():
         server_sock.bind((HOST, DEFAULT_PORT))
         server_sock.listen(50)
         log(f"OTPMail Relay Server started on {HOST}:{DEFAULT_PORT}")
+        log(f"Max connections: {MAX_CONNECTIONS} total, {MAX_PER_IP} per IP")
         log(f"{len(key_registry.keys)} users registered.")
         log(f"Server public key: {server_identity.get_public_hex()}")
         log(f"Server fingerprint: {server_identity.get_fingerprint()}")
@@ -348,13 +389,36 @@ def main():
     try:
         while True:
             client_sock, addr = server_sock.accept()
-            if is_banned(addr[0]):
-                log(f"BLOCKED banned IP: {addr[0]}")
+            client_ip = addr[0]
+
+            # Ban check
+            if is_banned(client_ip):
+                log(f"BLOCKED banned IP: {client_ip}")
                 client_sock.close()
                 continue
+
+            # Per-IP limit check
+            with ip_lock:
+                current = ip_counts.get(client_ip, 0)
+                if current >= MAX_PER_IP:
+                    log(f"BLOCKED {client_ip}: per-IP limit ({MAX_PER_IP})")
+                    client_sock.close()
+                    continue
+
+            # Global limit check (non-blocking)
+            if not conn_semaphore.acquire(blocking=False):
+                log(f"BLOCKED {client_ip}: server at max connections ({MAX_CONNECTIONS})")
+                client_sock.close()
+                continue
+
+            # Track the connection
+            with ip_lock:
+                ip_counts[client_ip] = ip_counts.get(client_ip, 0) + 1
+
             handler = ClientHandler(
-                client_sock, addr, master_key, mailbox, 
-                key_registry, clients, clients_lock, server_identity
+                client_sock, addr, master_key, mailbox,
+                key_registry, clients, clients_lock, server_identity,
+                conn_semaphore, ip_counts, ip_lock,
             )
             handler.start()
     except KeyboardInterrupt:
