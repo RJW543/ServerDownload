@@ -614,13 +614,16 @@ class EncryptedVault:
 class PadManager:
     """
     Indexed One-Time Pad Manager with full-entropy byte pads.
+    All pad data is encrypted at rest with AES-256-GCM when a
+    passphrase is provided. Legacy plaintext pads are auto-migrated
+    to encrypted storage on first access.
 
-    Storage per contact:
-      pad.txt  - all pages, one hex-encoded line each. Line number = page index.
-      role.txt - "generator" (created the pad) or "recipient" (received it).
-      used.txt - indices already consumed, one per line.
+    Storage per contact (encrypted):
+      pad.enc  - all pages, encrypted. Decrypted form: one hex line per page.
+      role.enc - "generator" or "recipient", encrypted.
+      used.enc - consumed page indices, encrypted.
 
-    Each page line (hex on disk):
+    Each page line (decrypted hex):
       [PAGE_ID: 8 hex chars][HMAC_KEY: 64 hex chars][OTP_CONTENT: N hex chars]
       Total per page with default 3500-byte content = 7072 hex chars.
 
@@ -637,12 +640,88 @@ class PadManager:
       INDEX:PAGE_ID:HMAC_HEX:CIPHERTEXT_HEX
     """
 
-    def __init__(self, pads_dir: Path):
+    def __init__(self, pads_dir: Path, passphrase: str = None):
         self.pads_dir = pads_dir
         self.pads_dir.mkdir(parents=True, exist_ok=True)
         # Per-contact locks to prevent race conditions in page destruction
         self._locks: dict = {}
         self._global_lock = threading.Lock()
+
+        # Derive encryption key for pad-at-rest protection
+        if passphrase:
+            self._pad_key = self._derive_pad_key(passphrase)
+        else:
+            self._pad_key = None
+
+    def _derive_pad_key(self, passphrase: str) -> bytes:
+        """Derive AES-256 key from vault passphrase for pad encryption."""
+        salt_file = self.pads_dir / ".pad_salt"
+        if salt_file.exists():
+            salt = salt_file.read_bytes()
+        else:
+            salt = secrets.token_bytes(16)
+            salt_file.write_bytes(salt)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(), length=32,
+            salt=salt, iterations=480_000,
+        )
+        return kdf.derive(passphrase.encode('utf-8'))
+
+    # -- encrypted I/O --
+
+    def _write_encrypted(self, filepath: Path, data: bytes):
+        """Encrypt data and write atomically with fsync."""
+        if self._pad_key:
+            nonce = secrets.token_bytes(12)
+            aesgcm = AESGCM(self._pad_key)
+            blob = nonce + aesgcm.encrypt(nonce, data, None)
+        else:
+            blob = data
+        tmp = filepath.with_suffix('.tmp')
+        tmp.write_bytes(blob)
+        fd = os.open(str(tmp), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(str(tmp), str(filepath))
+
+    def _read_decrypted(self, filepath: Path) -> bytes:
+        """Read file and decrypt. Returns plaintext bytes."""
+        blob = filepath.read_bytes()
+        if not self._pad_key:
+            return blob
+        if len(blob) < 13:
+            raise ValueError("Encrypted pad file too short")
+        aesgcm = AESGCM(self._pad_key)
+        return aesgcm.decrypt(blob[:12], blob[12:], None)
+
+    # -- migration from plaintext legacy files --
+
+    def _migrate_contact(self, cid: str):
+        """
+        Auto-migrate a contact from plaintext (.txt) to encrypted (.enc).
+        Idempotent — skips files that are already migrated.
+        Securely wipes the plaintext pad file after migration.
+        """
+        if not self._pad_key:
+            return
+        d = self._contact_dir(cid)
+
+        for old_name, new_name, wipe in [
+            ("pad.txt",  "pad.enc",  True),   # Wipe pad (sensitive key material)
+            ("role.txt", "role.enc", False),
+            ("used.txt", "used.enc", False),
+        ]:
+            old_fp = d / old_name
+            new_fp = d / new_name
+            if old_fp.exists() and not new_fp.exists():
+                data = old_fp.read_bytes()
+                self._write_encrypted(new_fp, data)
+                if wipe:
+                    size = old_fp.stat().st_size
+                    old_fp.write_bytes(secrets.token_bytes(size))
+                old_fp.unlink()
 
     def _get_contact_lock(self, cid: str) -> threading.Lock:
         """Get or create a threading lock for a specific contact."""
@@ -660,23 +739,24 @@ class PadManager:
         return d
 
     def _pad_file(self, cid: str) -> Path:
-        return self._contact_dir(cid) / "pad.txt"
+        return self._contact_dir(cid) / ("pad.enc" if self._pad_key else "pad.txt")
 
     def _role_file(self, cid: str) -> Path:
-        return self._contact_dir(cid) / "role.txt"
+        return self._contact_dir(cid) / ("role.enc" if self._pad_key else "role.txt")
 
     def _used_file(self, cid: str) -> Path:
-        return self._contact_dir(cid) / "used.txt"
+        return self._contact_dir(cid) / ("used.enc" if self._pad_key else "used.txt")
 
     # -- role helpers --
     def _get_role(self, cid: str) -> str:
         rf = self._role_file(cid)
         if rf.exists():
-            return rf.read_text(encoding='utf-8').strip()
+            data = self._read_decrypted(rf)
+            return data.decode('utf-8').strip()
         return "generator"
 
     def _set_role(self, cid: str, role: str):
-        self._role_file(cid).write_text(role, encoding='utf-8')
+        self._write_encrypted(self._role_file(cid), role.encode('utf-8'))
 
     def _send_parity(self, cid: str) -> int:
         """Generator sends on even (0), recipient sends on odd (1)."""
@@ -687,59 +767,53 @@ class PadManager:
         uf = self._used_file(cid)
         if not uf.exists():
             return set()
-        with open(uf, 'r', encoding='utf-8') as f:
-            used = set()
-            for line in f:
-                s = line.strip()
-                if s.isdigit():
-                    used.add(int(s))
-            return used
+        data = self._read_decrypted(uf)
+        used = set()
+        for line in data.decode('utf-8').splitlines():
+            s = line.strip()
+            if s.isdigit():
+                used.add(int(s))
+        return used
 
     def _mark_used(self, cid: str, index: int):
-        """Mark a page as used with fsync for crash-safety."""
+        """
+        Mark a page as used. Read-modify-write with encryption and fsync.
+        Crash-safe: if we crash before write completes, the old file is
+        intact (atomic rename) and the page will be re-consumed on next
+        attempt — safe because the message was not ACKed yet.
+        """
         uf = self._used_file(cid)
-        with open(uf, 'a', encoding='utf-8') as f:
-            f.write(f"{index}\n")
-            f.flush()
-            os.fsync(f.fileno())
+        if uf.exists():
+            text = self._read_decrypted(uf).decode('utf-8')
+        else:
+            text = ""
+        text += f"{index}\n"
+        self._write_encrypted(uf, text.encode('utf-8'))
 
     def _destroy_page_content(self, cid: str, index: int):
         """
-        Securely erase a consumed page and replace with marker.
+        Replace a consumed page with !USED! marker and re-encrypt.
 
-        1. Overwrites the page's hex chars with random hex of same length
-           (pushes random data to disk, defeating journal/wear-leveling recovery)
-        2. Replaces with !USED! marker via atomic temp-file rename
-           (crash during write doesn't corrupt the entire pad file)
+        With encryption-at-rest the disk never holds plaintext pad data,
+        so the two-pass plaintext overwrite is no longer needed. We simply
+        decrypt, replace the page line, and write the re-encrypted blob
+        atomically.
 
         MUST be called while holding the contact lock.
         """
         pf = self._pad_file(cid)
         if not pf.exists():
             return
-        with open(pf, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        data = self._read_decrypted(pf)
+        lines = data.decode('utf-8').split('\n')
+        if lines and lines[-1] == '':
+            lines = lines[:-1]
         if index < 0 or index >= len(lines):
             return
-
-        # Step 1: Overwrite with random data of same length (secure erase)
-        original_len = len(lines[index].rstrip('\n'))
-        if original_len > 6:  # Skip if already !USED!
-            random_overwrite = secrets.token_hex(original_len // 2)[:original_len]
-            lines[index] = random_overwrite + '\n'
-            with open(pf, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-                f.flush()
-                os.fsync(f.fileno())
-
-        # Step 2: Atomic replace with marker via temp file + rename
-        lines[index] = '!USED!\n'
-        tmp = pf.with_suffix('.tmp')
-        with open(tmp, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(str(tmp), str(pf))
+        if len(lines[index].strip()) > 6:  # Skip if already !USED!
+            lines[index] = '!USED!'
+        content = '\n'.join(lines) + '\n'
+        self._write_encrypted(pf, content.encode('utf-8'))
 
     # -- page parsing --
     @staticmethod
@@ -761,16 +835,26 @@ class PadManager:
 
     # -- page access --
     def _load_pages(self, cid: str) -> List[str]:
+        # Auto-migrate from plaintext if needed
+        self._migrate_contact(cid)
         pf = self._pad_file(cid)
         if not pf.exists():
             return []
-        with open(pf, 'r', encoding='utf-8') as f:
-            return [l.rstrip('\n') for l in f]
+        data = self._read_decrypted(pf)
+        lines = data.decode('utf-8').split('\n')
+        if lines and lines[-1] == '':
+            lines = lines[:-1]
+        return lines
 
     def contact_has_pad(self, cid: str) -> bool:
         try:
-            pf = self._pad_file(cid)
-            return pf.exists() and pf.stat().st_size > 0
+            d = self._contact_dir(cid)
+            # Check encrypted and legacy plaintext
+            for name in ("pad.enc", "pad.txt"):
+                fp = d / name
+                if fp.exists() and fp.stat().st_size > 0:
+                    return True
+            return False
         except ValueError:
             return False
 
@@ -835,7 +919,7 @@ class PadManager:
                 page_id, hmac_key, otp_content = parsed
                 # 1. Durably mark as used BEFORE reading content
                 self._mark_used(cid, i)
-                # 2. Destroy key material on disk
+                # 2. Destroy key material in encrypted file
                 self._destroy_page_content(cid, i)
                 return (i, page_id, hmac_key, otp_content)
             return None
@@ -873,7 +957,7 @@ class PadManager:
 
             # 1. Durably mark as used
             self._mark_used(cid, index)
-            # 2. Destroy key material on disk
+            # 2. Destroy key material in encrypted file
             self._destroy_page_content(cid, index)
             return (hmac_key, otp_content)
 
@@ -883,33 +967,36 @@ class PadManager:
         if not validate_username(cid):
             raise ValueError(f"Invalid contact ID: {repr(cid)}")
         self.delete_pad(cid)
-        pf = self._pad_file(cid)
-        with open(pf, 'w', encoding='utf-8') as out:
-            for _ in range(num_pages):
-                out.write(self._generate_page(page_length) + '\n')
+        lines = [self._generate_page(page_length) for _ in range(num_pages)]
+        content = '\n'.join(lines) + '\n'
+        self._write_encrypted(self._pad_file(cid), content.encode('utf-8'))
         self._set_role(cid, "generator")
         return num_pages
 
     def delete_pad(self, cid: str):
-        """Delete all pad data for a contact."""
+        """Delete all pad data for a contact (encrypted + legacy plaintext)."""
         try:
             d = self._contact_dir(cid)
         except ValueError:
             return
-        for fname in ("pad.txt", "role.txt", "used.txt", "cipher.txt"):
+        for fname in ("pad.enc", "role.enc", "used.enc",
+                      "pad.txt", "role.txt", "used.txt", "cipher.txt"):
             fp = d / fname
             if fp.exists():
-                if fname == "pad.txt":
+                if fname.startswith("pad"):
                     size = fp.stat().st_size
                     fp.write_bytes(secrets.token_bytes(size))
                 fp.unlink()
 
     def get_shareable_data(self, cid: str) -> str:
-        """Return raw pad content for E2E sharing with the contact."""
+        """Return raw pad content (decrypted) for E2E sharing with the contact."""
+        # Ensure migration first
+        self._migrate_contact(cid)
         pf = self._pad_file(cid)
         if not pf.exists():
             return ""
-        return pf.read_text(encoding='utf-8').strip()
+        data = self._read_decrypted(pf)
+        return data.decode('utf-8').strip()
 
     def import_shared_pad(self, cid: str, pad_data: str) -> int:
         """Import pad received from contact, REPLACING any existing pad."""
@@ -920,11 +1007,9 @@ class PadManager:
         if not pages:
             return 0
         self.delete_pad(cid)
-        pf = self._pad_file(cid)
-        pf.parent.mkdir(parents=True, exist_ok=True)
-        with open(pf, 'w', encoding='utf-8') as f:
-            for page in pages:
-                f.write(page.rstrip('\n') + '\n')
+        self._contact_dir(cid)  # Ensure directory exists
+        content = '\n'.join(p.rstrip('\n') for p in pages) + '\n'
+        self._write_encrypted(self._pad_file(cid), content.encode('utf-8'))
         self._set_role(cid, "recipient")
         return len(pages)
 
@@ -942,8 +1027,13 @@ class PadManager:
     def get_all_contacts(self) -> List[str]:
         if not self.pads_dir.exists():
             return []
-        return sorted(d.name for d in self.pads_dir.iterdir()
-                      if d.is_dir() and (d / "pad.txt").exists())
+        contacts = []
+        for d in self.pads_dir.iterdir():
+            if d.is_dir():
+                # Check both encrypted and legacy plaintext
+                if (d / "pad.enc").exists() or (d / "pad.txt").exists():
+                    contacts.append(d.name)
+        return sorted(contacts)
 
 
 # ============================================================
