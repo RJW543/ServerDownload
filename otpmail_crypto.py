@@ -1,8 +1,10 @@
 
 import os
+import re
 import json
 import secrets
-import string
+import hmac as hmac_mod
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List
@@ -18,75 +20,114 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 #  CONFIGURATION
 # ============================================================
 
-PAGE_ID_LENGTH = 8
-DEFAULT_PAGE_LENGTH = 3500
+PAGE_ID_HEX_LEN = 8          # 4 bytes = 8 hex chars for page identification
+HMAC_KEY_BYTES = 32           # 256-bit HMAC key per page
+HMAC_KEY_HEX_LEN = 64        # 32 bytes = 64 hex chars
+PAGE_HEADER_HEX_LEN = PAGE_ID_HEX_LEN + HMAC_KEY_HEX_LEN  # 72
+DEFAULT_PAGE_LENGTH = 3500    # Bytes of OTP content per page
 MESSAGE_TTL_HOURS = 48
-MESSAGE_SEPARATOR = '\x00'  # Null byte separates subject from body in OTP plaintext
+MESSAGE_SEPARATOR = '\x00'   # Null byte separates subject from body
 
-OTP_CHARSET = string.ascii_uppercase + string.digits + string.punctuation
-OTP_CHARSET_LEN = len(OTP_CHARSET)  # 68
-OTP_REJECTION_LIMIT = 204           # 68 * 3, unbiased sampling
+# Legacy compat alias
+PAGE_ID_LENGTH = PAGE_ID_HEX_LEN
+
+_USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
+
+
+def validate_username(username: str) -> bool:
+    """
+    Validate username to prevent directory traversal and other injection.
+    Allows letters, digits, underscore, hyphen. 1-32 characters.
+    Rejects: empty, dots, slashes, spaces, special chars.
+    """
+    return bool(_USERNAME_RE.match(username))
+
+
+def compute_safety_number(local_x25519_pub_hex: str,
+                          remote_x25519_pub_hex: str) -> str:
+    """
+    Compute a safety number for out-of-band verification of a contact's
+    X25519 public key. Both parties compute the same value regardless of
+    who is 'local' vs 'remote' (keys are sorted before hashing).
+
+    Returns a 48-digit decimal string formatted in groups of 5 for easy
+    verbal comparison.
+    """
+    import hashlib
+    keys = sorted([local_x25519_pub_hex, remote_x25519_pub_hex])
+    digest = hashlib.sha256((keys[0] + keys[1]).encode('ascii')).hexdigest()
+    # Full SHA-256 gives ~77 decimal digits — take 60 (12 groups of 5)
+    numeric = str(int(digest, 16)).zfill(78)[-60:]
+    return '  '.join(numeric[i:i+5] for i in range(0, 60, 5))
 
 
 # ============================================================
-#  1. OTP LAYER - XOR Encryption with One-Time Pad
+#  1. OTP LAYER - Full-Entropy Byte-Based XOR + HMAC Integrity
 # ============================================================
 
-def otp_xor_encrypt(plaintext: str, pad_content: str) -> str:
-    """Encrypt plaintext by XOR with pad content. Returns hex-encoded ciphertext."""
+def otp_xor_encrypt(plaintext: bytes, pad_content: bytes) -> bytes:
+    """
+    Encrypt plaintext by XOR with full-entropy pad bytes.
+    Both inputs are raw bytes. Returns raw ciphertext bytes.
+    """
     if len(plaintext) > len(pad_content):
-        raise ValueError(f"Message ({len(plaintext)} chars) exceeds pad page ({len(pad_content)} chars)")
-    encrypted = []
-    for i, char in enumerate(plaintext):
-        encrypted.append(ord(char) ^ ord(pad_content[i]))
-    return bytes(encrypted).hex()
+        raise ValueError(
+            f"Message ({len(plaintext)} bytes) exceeds pad page ({len(pad_content)} bytes)")
+    return bytes(p ^ k for p, k in zip(plaintext, pad_content))
 
 
-def otp_xor_decrypt(hex_ciphertext: str, pad_content: str) -> str:
-    """Decrypt hex-encoded ciphertext by XOR with pad content."""
-    try:
-        cipher_bytes = bytes.fromhex(hex_ciphertext)
-    except ValueError:
-        raise ValueError("Invalid hex ciphertext")
-    decrypted = []
-    for i, byte_val in enumerate(cipher_bytes):
-        if i >= len(pad_content):
-            break
-        decrypted.append(chr(byte_val ^ ord(pad_content[i])))
-    return ''.join(decrypted)
+def otp_xor_decrypt(ciphertext: bytes, pad_content: bytes) -> bytes:
+    """Decrypt ciphertext by XOR with pad bytes."""
+    if len(ciphertext) > len(pad_content):
+        raise ValueError("Ciphertext longer than pad content")
+    return bytes(c ^ k for c, k in zip(ciphertext, pad_content))
 
 
-def pack_message(subject: str, body: str) -> str:
-    """Pack subject + body into single plaintext for OTP encryption.
-    Subject is encrypted alongside the body — never exposed in protocol headers."""
-    return subject + MESSAGE_SEPARATOR + body
+def compute_otp_hmac(hmac_key: bytes, ciphertext: bytes) -> bytes:
+    """Compute HMAC-SHA256 over ciphertext using the page's HMAC key."""
+    return hmac_mod.new(hmac_key, ciphertext, 'sha256').digest()
 
 
-def unpack_message(plaintext: str) -> Tuple[str, str]:
-    """Unpack subject and body from decrypted OTP plaintext."""
-    if MESSAGE_SEPARATOR in plaintext:
-        subject, body = plaintext.split(MESSAGE_SEPARATOR, 1)
+def verify_otp_hmac(hmac_key: bytes, ciphertext: bytes, expected_mac: bytes) -> bool:
+    """Constant-time HMAC verification."""
+    computed = hmac_mod.new(hmac_key, ciphertext, 'sha256').digest()
+    return hmac_mod.compare_digest(computed, expected_mac)
+
+
+def pack_message(subject: str, body: str) -> bytes:
+    """Pack subject + body into bytes for OTP encryption.
+    Subject is encrypted alongside the body - never exposed in protocol headers."""
+    return (subject + MESSAGE_SEPARATOR + body).encode('utf-8')
+
+
+def unpack_message(plaintext: bytes) -> Tuple[str, str]:
+    """Unpack subject and body from decrypted OTP bytes."""
+    text = plaintext.decode('utf-8', errors='replace')
+    if MESSAGE_SEPARATOR in text:
+        subject, body = text.split(MESSAGE_SEPARATOR, 1)
         return (subject, body)
-    return ("(no subject)", plaintext)
+    return ("(no subject)", text)
 
 
 # ============================================================
 #  2. AES TRANSIT LAYER - Per-Session Keys via HKDF
 # ============================================================
 
-def derive_master_key(passphrase: str) -> bytes:
+def derive_master_key(transit_key_hex: str) -> bytes:
     """
-    Derive master key from shared passphrase using PBKDF2.
-    Done once at startup. Combined with per-session random salt
-    via HKDF to produce unique session keys.
+    Derive master key from high-entropy transit key using HKDF.
+    HKDF is the correct primitive when the input key material already
+    has full entropy (256-bit random transit key), unlike PBKDF2 which
+    is designed for low-entropy passwords.
     """
-    kdf = PBKDF2HMAC(
+    key_bytes = bytes.fromhex(transit_key_hex)
+    hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b"OTPMail-MasterKey-v2",
-        iterations=480_000,
+        salt=None,
+        info=b"OTPMail-MasterKey-v3",
     )
-    return kdf.derive(passphrase.encode('utf-8'))
+    return hkdf.derive(key_bytes)
 
 
 def load_transit_key_from_file(filepath) -> str:
@@ -110,18 +151,6 @@ def generate_transit_key_file(filepath) -> str:
     return key
 
 
-import re
-_USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
-
-def validate_username(username: str) -> bool:
-    """
-    Validate username to prevent directory traversal and other injection.
-    Allows letters, digits, underscore, hyphen. 1-32 characters.
-    Rejects: empty, dots, slashes, spaces, special chars.
-    """
-    return bool(_USERNAME_RE.match(username))
-
-
 def generate_session_salt() -> bytes:
     """Generate a 16-byte random salt for a new session."""
     return secrets.token_bytes(16)
@@ -132,8 +161,7 @@ def derive_session_key(master_key: bytes, session_salt: bytes,
     """
     Derive unique session transit key from master key + random salt.
     When ecdh_secret is provided (from ephemeral ECDHE), it's mixed in
-    for forward secrecy — even if the transit key is later compromised,
-    past session keys cannot be reconstructed.
+    for forward secrecy.
     """
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
@@ -160,22 +188,25 @@ def compute_ecdh_secret(private_key: X25519PrivateKey,
     return private_key.exchange(peer_public)
 
 
-def aes_transit_encrypt(plaintext_bytes: bytes, session_key: bytes) -> bytes:
-    """Encrypt for transit. Returns: nonce (12B) || ciphertext+tag."""
+def aes_transit_encrypt(plaintext_bytes: bytes, session_key: bytes,
+                       aad: bytes = None) -> bytes:
+    """Encrypt for transit. Returns: nonce (12B) || ciphertext+tag.
+    Optional AAD (additional authenticated data) for sequence binding."""
     nonce = secrets.token_bytes(12)
     aesgcm = AESGCM(session_key)
-    ct = aesgcm.encrypt(nonce, plaintext_bytes, None)
+    ct = aesgcm.encrypt(nonce, plaintext_bytes, aad)
     return nonce + ct
 
 
-def aes_transit_decrypt(encrypted_blob: bytes, session_key: bytes) -> bytes:
-    """Decrypt transit-encrypted data."""
+def aes_transit_decrypt(encrypted_blob: bytes, session_key: bytes,
+                        aad: bytes = None) -> bytes:
+    """Decrypt transit-encrypted data. AAD must match what was used to encrypt."""
     if len(encrypted_blob) < 13:
         raise ValueError("Encrypted data too short")
     nonce = encrypted_blob[:12]
     ct = encrypted_blob[12:]
     aesgcm = AESGCM(session_key)
-    return aesgcm.decrypt(nonce, ct, None)
+    return aesgcm.decrypt(nonce, ct, aad)
 
 
 # ============================================================
@@ -189,12 +220,14 @@ class KeyManager:
     Ed25519: Challenge-response authentication.
     X25519:  End-to-end encrypting cipher pads (server cannot read).
 
-    Keys stored as PEM files. Generated on first run (TOFU model).
+    Keys stored as PEM files, optionally encrypted with a passphrase.
+    Generated on first run (TOFU model).
     """
 
-    def __init__(self, keys_dir: Path):
+    def __init__(self, keys_dir: Path, passphrase: str = None):
         self.keys_dir = keys_dir
         self.keys_dir.mkdir(parents=True, exist_ok=True)
+        self._passphrase = passphrase
 
         self.ed25519_private: Ed25519PrivateKey = None
         self.ed25519_public: Ed25519PublicKey = None
@@ -203,16 +236,66 @@ class KeyManager:
 
         self._load_or_generate()
 
+        # Passphrase no longer needed — keys are loaded into memory objects.
+        # Scrub the string reference (best-effort; CPython may retain copies).
+        self._passphrase = None
+
+    def _get_encryption(self):
+        """Return PEM encryption scheme - passphrase-based if available."""
+        if self._passphrase:
+            return serialization.BestAvailableEncryption(
+                self._passphrase.encode('utf-8'))
+        return serialization.NoEncryption()
+
+    def _get_password(self):
+        """Return password bytes for loading encrypted PEM, or None."""
+        if self._passphrase:
+            return self._passphrase.encode('utf-8')
+        return None
+
+    @staticmethod
+    def _pem_is_encrypted(pem_data: bytes) -> bool:
+        """Check if a PEM file is passphrase-encrypted."""
+        return b'ENCRYPTED' in pem_data
+
     def _load_or_generate(self):
         ed_priv_path = self.keys_dir / "ed25519_private.pem"
         x_priv_path = self.keys_dir / "x25519_private.pem"
 
         if ed_priv_path.exists() and x_priv_path.exists():
-            self.ed25519_private = serialization.load_pem_private_key(
-                ed_priv_path.read_bytes(), password=None)
+            password = self._get_password()
+
+            # Load Ed25519
+            ed_pem = ed_priv_path.read_bytes()
+            if self._pem_is_encrypted(ed_pem):
+                # Key IS encrypted — password is required, no fallback
+                if not password:
+                    raise ValueError(
+                        "Ed25519 key is passphrase-encrypted but no passphrase provided")
+                self.ed25519_private = serialization.load_pem_private_key(
+                    ed_pem, password=password)
+            else:
+                # Key is NOT encrypted — load without password
+                self.ed25519_private = serialization.load_pem_private_key(
+                    ed_pem, password=None)
+                # If passphrase is set, migrate to encrypted (one-time)
+                if password:
+                    self._save_key(ed_priv_path, self.ed25519_private)
             self.ed25519_public = self.ed25519_private.public_key()
-            self.x25519_private = serialization.load_pem_private_key(
-                x_priv_path.read_bytes(), password=None)
+
+            # Load X25519 — same logic
+            x_pem = x_priv_path.read_bytes()
+            if self._pem_is_encrypted(x_pem):
+                if not password:
+                    raise ValueError(
+                        "X25519 key is passphrase-encrypted but no passphrase provided")
+                self.x25519_private = serialization.load_pem_private_key(
+                    x_pem, password=password)
+            else:
+                self.x25519_private = serialization.load_pem_private_key(
+                    x_pem, password=None)
+                if password:
+                    self._save_key(x_priv_path, self.x25519_private)
             self.x25519_public = self.x25519_private.public_key()
         else:
             self.ed25519_private = Ed25519PrivateKey.generate()
@@ -220,16 +303,16 @@ class KeyManager:
             self.x25519_private = X25519PrivateKey.generate()
             self.x25519_public = self.x25519_private.public_key()
 
-            ed_priv_path.write_bytes(self.ed25519_private.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ))
-            x_priv_path.write_bytes(self.x25519_private.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ))
+            self._save_key(ed_priv_path, self.ed25519_private)
+            self._save_key(x_priv_path, self.x25519_private)
+
+    def _save_key(self, path: Path, private_key):
+        """Save a private key to PEM, encrypted if passphrase is set."""
+        path.write_bytes(private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            self._get_encryption(),
+        ))
 
     def get_ed25519_public_hex(self) -> str:
         return self.ed25519_public.public_bytes(
@@ -252,32 +335,67 @@ class KeyManager:
             return False
 
     def e2e_encrypt(self, plaintext: bytes, recipient_x25519_pub_hex: str) -> bytes:
-        """Encrypt with ECDH shared secret. Server cannot decrypt."""
+        """
+        Encrypt with ephemeral-static ECDH + sender authentication.
+
+        Combines:
+          1. ephemeral_priv x recipient_static_pub  (forward secrecy)
+          2. sender_static_priv x recipient_static_pub  (authentication)
+
+        Blob format: eph_pub(32B) || nonce(12B) || ciphertext+tag
+
+        Forward secrecy: even if the sender's static X25519 key is later
+        compromised, past transfers remain secure because the ephemeral
+        private key was deleted immediately after use.
+        """
         peer_pub = X25519PublicKey.from_public_bytes(
             bytes.fromhex(recipient_x25519_pub_hex))
-        shared_secret = self.x25519_private.exchange(peer_pub)
+
+        # Ephemeral key for forward secrecy
+        eph_priv, eph_pub = generate_ephemeral_x25519()
+        ecdh_ephemeral = eph_priv.exchange(peer_pub)
+        del eph_priv  # Destroy ephemeral private key immediately
+
+        # Static key for sender authentication
+        ecdh_static = self.x25519_private.exchange(peer_pub)
+
+        # Derive key from both secrets
         derived_key = HKDF(
             algorithm=hashes.SHA256(), length=32, salt=None,
-            info=b"OTPMail-E2E-PadTransfer-v2",
-        ).derive(shared_secret)
+            info=b"OTPMail-E2E-PadTransfer-v3",
+        ).derive(ecdh_ephemeral + ecdh_static)
+
         nonce = secrets.token_bytes(12)
         aesgcm = AESGCM(derived_key)
         ct = aesgcm.encrypt(nonce, plaintext, None)
-        return nonce + ct
+        return eph_pub + nonce + ct
 
     def e2e_decrypt(self, encrypted_blob: bytes, sender_x25519_pub_hex: str) -> bytes:
-        """Decrypt E2E data using ECDH shared secret."""
-        peer_pub = X25519PublicKey.from_public_bytes(
+        """
+        Decrypt E2E data using ephemeral-static + static-static ECDH.
+
+        Requires sender's static X25519 pub for authentication verification.
+        """
+        if len(encrypted_blob) < 32 + 12 + 16:
+            raise ValueError("E2E data too short")
+
+        eph_pub_bytes = encrypted_blob[:32]
+        nonce = encrypted_blob[32:44]
+        ct = encrypted_blob[44:]
+
+        eph_pub = X25519PublicKey.from_public_bytes(eph_pub_bytes)
+        sender_pub = X25519PublicKey.from_public_bytes(
             bytes.fromhex(sender_x25519_pub_hex))
-        shared_secret = self.x25519_private.exchange(peer_pub)
+
+        # Reverse the two ECDH operations
+        ecdh_ephemeral = self.x25519_private.exchange(eph_pub)
+        ecdh_static = self.x25519_private.exchange(sender_pub)
+
         derived_key = HKDF(
             algorithm=hashes.SHA256(), length=32, salt=None,
-            info=b"OTPMail-E2E-PadTransfer-v2",
-        ).derive(shared_secret)
-        if len(encrypted_blob) < 13:
-            raise ValueError("E2E data too short")
-        nonce = encrypted_blob[:12]
-        ct = encrypted_blob[12:]
+            info=b"OTPMail-E2E-PadTransfer-v3",
+        ).derive(ecdh_ephemeral + ecdh_static)
+
         aesgcm = AESGCM(derived_key)
         return aesgcm.decrypt(nonce, ct, None)
 
@@ -291,33 +409,80 @@ class ServerIdentity:
         salt (16B) || server_ed25519_pub (32B) || server_eph_pub (32B)
         || signature(salt || server_eph_pub) (64B) = 144 bytes
     The client verifies the signature and pins the public key via TOFU.
+
+    The PEM file is encrypted with a passphrase if one is provided.
+    Set via OTPMAIL_SERVER_PASSPHRASE env var or passed directly.
+    If no passphrase is set, falls back to unencrypted (with warning).
     """
 
     KEY_FILE = "server_identity_ed25519.pem"
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, passphrase: str = None):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Prefer explicit passphrase, then env var
+        self._passphrase = passphrase or os.environ.get("OTPMAIL_SERVER_PASSPHRASE", "")
         self._private: Ed25519PrivateKey = None
         self._public: Ed25519PublicKey = None
         self._load_or_generate()
+        # Passphrase no longer needed after key is loaded
+        self._passphrase = None
+
+    def _get_encryption(self):
+        if self._passphrase:
+            return serialization.BestAvailableEncryption(
+                self._passphrase.encode('utf-8'))
+        return serialization.NoEncryption()
+
+    def _get_password(self) -> Optional[bytes]:
+        if self._passphrase:
+            return self._passphrase.encode('utf-8')
+        return None
 
     def _load_or_generate(self):
         key_path = self.data_dir / self.KEY_FILE
+        password = self._get_password()
+
         if key_path.exists():
-            self._private = serialization.load_pem_private_key(
-                key_path.read_bytes(), password=None)
+            pem_data = key_path.read_bytes()
+            pem_is_encrypted = b'ENCRYPTED' in pem_data
+
+            if pem_is_encrypted:
+                if not password:
+                    raise ValueError(
+                        "Server identity key is passphrase-encrypted but "
+                        "OTPMAIL_SERVER_PASSPHRASE is not set")
+                self._private = serialization.load_pem_private_key(
+                    pem_data, password=password)
+            else:
+                self._private = serialization.load_pem_private_key(
+                    pem_data, password=None)
+                # Auto-migrate: re-encrypt with passphrase if one is now set
+                if password:
+                    key_path.write_bytes(self._private.private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.PKCS8,
+                        self._get_encryption(),
+                    ))
         else:
             self._private = Ed25519PrivateKey.generate()
+            if not password:
+                import warnings
+                warnings.warn(
+                    "Server identity key stored WITHOUT encryption. "
+                    "Set OTPMAIL_SERVER_PASSPHRASE env var to protect it.",
+                    stacklevel=2)
             key_path.write_bytes(self._private.private_bytes(
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
+                self._get_encryption(),
             ))
+            # Restrict file permissions (owner-only read/write)
+            os.chmod(str(key_path), 0o600)
+
         self._public = self._private.public_key()
 
     def get_public_bytes(self) -> bytes:
-        """Return raw 32-byte public key."""
         return self._public.public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
@@ -325,23 +490,19 @@ class ServerIdentity:
         return self.get_public_bytes().hex()
 
     def get_fingerprint(self) -> str:
-        """SHA-256 fingerprint for display / verification."""
         import hashlib
         digest = hashlib.sha256(self.get_public_bytes()).hexdigest()
         return ':'.join(digest[i:i+4] for i in range(0, 32, 4))
 
     def sign_data(self, data: bytes) -> bytes:
-        """Sign arbitrary data. Returns 64-byte Ed25519 signature."""
         return self._private.sign(data)
 
-    # Keep backward-compatible alias
     def sign_salt(self, salt: bytes) -> bytes:
         return self.sign_data(salt)
 
     @staticmethod
     def verify_server_signature(server_pub_bytes: bytes, signature: bytes,
                                 data: bytes) -> bool:
-        """Client-side: verify the server signed this data."""
         try:
             pub = Ed25519PublicKey.from_public_bytes(server_pub_bytes)
             pub.verify(signature, data)
@@ -359,6 +520,23 @@ class EncryptedVault:
         self.vault_dir = vault_dir
         self.vault_dir.mkdir(parents=True, exist_ok=True)
         self._key = self._derive_vault_key(passphrase)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _safe_filename(filename: str) -> str:
+        """
+        Defence-in-depth: reject any filename that could escape the vault dir.
+        Even though callers currently sanitise inputs, the vault itself must
+        not trust them.
+        """
+        if not filename:
+            raise ValueError("Empty vault filename")
+        basename = Path(filename).name
+        if basename != filename:
+            raise ValueError(f"Vault filename contains path components: {repr(filename)}")
+        if '..' in filename or '/' in filename or '\\' in filename:
+            raise ValueError(f"Vault filename contains illegal characters: {repr(filename)}")
+        return filename
 
     def _derive_vault_key(self, passphrase: str) -> bytes:
         salt_file = self.vault_dir / ".vault_salt"
@@ -374,18 +552,40 @@ class EncryptedVault:
         return kdf.derive(passphrase.encode('utf-8'))
 
     def encrypt_and_store(self, filename: str, data: dict):
+        """
+        Atomic + durable vault write.
+        Writes to temp file, fsyncs, then renames (atomic on POSIX).
+        Thread-safe via internal lock.
+        """
+        filename = self._safe_filename(filename)
         plaintext = json.dumps(data).encode('utf-8')
         nonce = secrets.token_bytes(12)
         aesgcm = AESGCM(self._key)
         ct = aesgcm.encrypt(nonce, plaintext, None)
-        (self.vault_dir / filename).write_bytes(nonce + ct)
+        target = self.vault_dir / filename
+        tmp = target.with_suffix('.tmp')
+        with self._lock:
+            tmp.write_bytes(nonce + ct)
+            # fsync the temp file to ensure durability before rename
+            fd = os.open(str(tmp), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(str(tmp), str(target))
 
     def load_and_decrypt(self, filename: str) -> Optional[dict]:
+        filename = self._safe_filename(filename)
         fp = self.vault_dir / filename
-        if not fp.exists():
-            return None
+        with self._lock:
+            if not fp.exists():
+                return None
+            try:
+                blob = fp.read_bytes()
+            except Exception:
+                return None
+        # Decryption outside lock (CPU-bound, doesn't need file access)
         try:
-            blob = fp.read_bytes()
             aesgcm = AESGCM(self._key)
             plaintext = aesgcm.decrypt(blob[:12], blob[12:], None)
             return json.loads(plaintext.decode('utf-8'))
@@ -393,47 +593,68 @@ class EncryptedVault:
             return None
 
     def delete_file(self, filename: str):
+        filename = self._safe_filename(filename)
         fp = self.vault_dir / filename
-        if fp.exists():
-            fp.write_bytes(secrets.token_bytes(fp.stat().st_size))
-            fp.unlink()
+        with self._lock:
+            if fp.exists():
+                fp.write_bytes(secrets.token_bytes(fp.stat().st_size))
+                fp.unlink()
 
     def list_files(self, prefix: str = "") -> List[str]:
-        return sorted(f.name for f in self.vault_dir.iterdir()
-                      if f.is_file() and not f.name.startswith('.') and f.name.startswith(prefix))
+        with self._lock:
+            return sorted(f.name for f in self.vault_dir.iterdir()
+                          if f.is_file() and not f.name.startswith('.')
+                          and f.name.startswith(prefix))
 
 
 # ============================================================
-#  5. PAD MANAGER
+#  5. PAD MANAGER - Full-Entropy Byte Pads with HMAC Integrity
 # ============================================================
 
 class PadManager:
     """
-    Indexed One-Time Pad Manager.
+    Indexed One-Time Pad Manager with full-entropy byte pads.
 
     Storage per contact:
-      pad.txt  — all pages, one per line. Line number = page index (0-based).
-      role.txt — "generator" (created the pad) or "recipient" (received it).
-      used.txt — indices already consumed, one per line.
+      pad.txt  - all pages, one hex-encoded line each. Line number = page index.
+      role.txt - "generator" (created the pad) or "recipient" (received it).
+      used.txt - indices already consumed, one per line.
+
+    Each page line (hex on disk):
+      [PAGE_ID: 8 hex chars][HMAC_KEY: 64 hex chars][OTP_CONTENT: N hex chars]
+      Total per page with default 3500-byte content = 7072 hex chars.
 
     Sync mechanism:
-      The generator sends using EVEN-indexed pages (0, 2, 4, …).
-      The recipient sends using ODD-indexed pages  (1, 3, 5, …).
-      The page index travels UNENCRYPTED at the front of every payload
-      so the receiver always knows exactly which page to decrypt with.
-      Since each direction draws from non-overlapping indices, desync
-      is impossible regardless of message ordering or timing.
+      Generator sends on EVEN indices (0, 2, 4, ...).
+      Recipient sends on ODD indices (1, 3, 5, ...).
 
-    Payload wire format (constructed by client):
-      INDEX:PAGE_ID:hex_ciphertext
+    HMAC integrity:
+      Each page includes a 32-byte HMAC key. After XOR encryption, an
+      HMAC-SHA256 is computed over the ciphertext and included in the
+      payload. This detects bitflip attacks against the OTP ciphertext.
+
+    Payload wire format:
+      INDEX:PAGE_ID:HMAC_HEX:CIPHERTEXT_HEX
     """
 
     def __init__(self, pads_dir: Path):
         self.pads_dir = pads_dir
         self.pads_dir.mkdir(parents=True, exist_ok=True)
+        # Per-contact locks to prevent race conditions in page destruction
+        self._locks: dict = {}
+        self._global_lock = threading.Lock()
+
+    def _get_contact_lock(self, cid: str) -> threading.Lock:
+        """Get or create a threading lock for a specific contact."""
+        with self._global_lock:
+            if cid not in self._locks:
+                self._locks[cid] = threading.Lock()
+            return self._locks[cid]
 
     # -- paths --
     def _contact_dir(self, cid: str) -> Path:
+        if not validate_username(cid):
+            raise ValueError(f"Invalid contact ID: {repr(cid)}")
         d = self.pads_dir / cid
         d.mkdir(exist_ok=True)
         return d
@@ -446,10 +667,6 @@ class PadManager:
 
     def _used_file(self, cid: str) -> Path:
         return self._contact_dir(cid) / "used.txt"
-
-    # kept for legacy compat check
-    def _cipher_file(self, cid: str) -> Path:
-        return self._contact_dir(cid) / "cipher.txt"
 
     # -- role helpers --
     def _get_role(self, cid: str) -> str:
@@ -488,9 +705,14 @@ class PadManager:
 
     def _destroy_page_content(self, cid: str, index: int):
         """
-        Overwrite the page content in pad.txt with a short marker.
-        The marker is shorter than PAGE_ID_LENGTH so the page will fail
-        the length check and be unreadable even if used.txt is lost.
+        Securely erase a consumed page and replace with marker.
+
+        1. Overwrites the page's hex chars with random hex of same length
+           (pushes random data to disk, defeating journal/wear-leveling recovery)
+        2. Replaces with !USED! marker via atomic temp-file rename
+           (crash during write doesn't corrupt the entire pad file)
+
+        MUST be called while holding the contact lock.
         """
         pf = self._pad_file(cid)
         if not pf.exists():
@@ -499,12 +721,43 @@ class PadManager:
             lines = f.readlines()
         if index < 0 or index >= len(lines):
             return
-        # Replace with short marker that fails len > PAGE_ID_LENGTH check
+
+        # Step 1: Overwrite with random data of same length (secure erase)
+        original_len = len(lines[index].rstrip('\n'))
+        if original_len > 6:  # Skip if already !USED!
+            random_overwrite = secrets.token_hex(original_len // 2)[:original_len]
+            lines[index] = random_overwrite + '\n'
+            with open(pf, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+                f.flush()
+                os.fsync(f.fileno())
+
+        # Step 2: Atomic replace with marker via temp file + rename
         lines[index] = '!USED!\n'
-        with open(pf, 'w', encoding='utf-8') as f:
+        tmp = pf.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
             f.writelines(lines)
             f.flush()
             os.fsync(f.fileno())
+        os.rename(str(tmp), str(pf))
+
+    # -- page parsing --
+    @staticmethod
+    def _parse_page(line: str) -> Optional[Tuple[str, bytes, bytes]]:
+        """
+        Parse a hex-encoded page line into (page_id_hex, hmac_key, otp_content).
+        Returns None if the page is consumed or malformed.
+        """
+        line = line.strip()
+        if len(line) <= PAGE_HEADER_HEX_LEN:
+            return None
+        try:
+            page_id = line[:PAGE_ID_HEX_LEN]
+            hmac_key = bytes.fromhex(line[PAGE_ID_HEX_LEN:PAGE_HEADER_HEX_LEN])
+            otp_content = bytes.fromhex(line[PAGE_HEADER_HEX_LEN:])
+            return (page_id, hmac_key, otp_content)
+        except ValueError:
+            return None
 
     # -- page access --
     def _load_pages(self, cid: str) -> List[str]:
@@ -515,17 +768,23 @@ class PadManager:
             return [l.rstrip('\n') for l in f]
 
     def contact_has_pad(self, cid: str) -> bool:
-        pf = self._pad_file(cid)
-        return pf.exists() and pf.stat().st_size > 0
+        try:
+            pf = self._pad_file(cid)
+            return pf.exists() and pf.stat().st_size > 0
+        except ValueError:
+            return False
 
     def get_page_count(self, cid: str) -> int:
         """Return number of remaining SEND pages for this side."""
         pages = self._load_pages(cid)
         used = self._load_used(cid)
         parity = self._send_parity(cid)
-        return sum(1 for i in range(len(pages))
-                   if i % 2 == parity and i not in used
-                   and len(pages[i].strip()) > PAGE_ID_LENGTH)
+        count = 0
+        for i in range(len(pages)):
+            if i % 2 == parity and i not in used:
+                if self._parse_page(pages[i]) is not None:
+                    count += 1
+        return count
 
     def get_recv_remaining(self, cid: str) -> int:
         """Return number of remaining RECV pages for this side."""
@@ -533,72 +792,96 @@ class PadManager:
         used = self._load_used(cid)
         parity = self._send_parity(cid)
         recv_parity = 1 - parity
-        return sum(1 for i in range(len(pages))
-                   if i % 2 == recv_parity and i not in used
-                   and len(pages[i].strip()) > PAGE_ID_LENGTH)
+        count = 0
+        for i in range(len(pages)):
+            if i % 2 == recv_parity and i not in used:
+                if self._parse_page(pages[i]) is not None:
+                    count += 1
+        return count
 
     def get_total_remaining(self, cid: str) -> int:
         """Total unused pages (send + recv)."""
         pages = self._load_pages(cid)
         used = self._load_used(cid)
-        return sum(1 for i in range(len(pages))
-                   if i not in used and len(pages[i].strip()) > PAGE_ID_LENGTH)
+        count = 0
+        for i in range(len(pages)):
+            if i not in used and self._parse_page(pages[i]) is not None:
+                count += 1
+        return count
 
-    def consume_page(self, cid: str) -> Optional[Tuple[int, str, str]]:
+    def consume_page(self, cid: str) -> Optional[Tuple[int, str, bytes, bytes]]:
         """
         Pick the next available SEND page (matching our parity).
-        Returns (index, page_id, page_content) or None.
+        Returns (index, page_id_hex, hmac_key, otp_content) or None.
 
-        Safety order: mark used (fsync) → read content → destroy page.
-        Even if the app crashes after mark but before send, the page
-        is safely wasted rather than risking reuse.
+        Thread-safe: holds a per-contact lock to prevent concurrent
+        read-modify-write races in _destroy_page_content.
         """
-        pages = self._load_pages(cid)
-        used = self._load_used(cid)
-        parity = self._send_parity(cid)
+        lock = self._get_contact_lock(cid)
+        with lock:
+            pages = self._load_pages(cid)
+            used = self._load_used(cid)
+            parity = self._send_parity(cid)
 
-        for i in range(len(pages)):
-            if i % 2 != parity:
-                continue
-            if i in used:
-                continue
-            line = pages[i]
-            if len(line.strip()) <= PAGE_ID_LENGTH:
-                continue
-            # 1. Durably mark as used BEFORE reading content
-            self._mark_used(cid, i)
-            page_id = line[:PAGE_ID_LENGTH]
-            page_content = line[PAGE_ID_LENGTH:]
-            # 2. Destroy key material on disk (backup-restoration defence)
-            self._destroy_page_content(cid, i)
-            return (i, page_id, page_content)
-        return None
+            for i in range(len(pages)):
+                if i % 2 != parity:
+                    continue
+                if i in used:
+                    continue
+                parsed = self._parse_page(pages[i])
+                if parsed is None:
+                    continue
 
-    def find_page_by_index(self, index: int, cid: str) -> Optional[str]:
+                page_id, hmac_key, otp_content = parsed
+                # 1. Durably mark as used BEFORE reading content
+                self._mark_used(cid, i)
+                # 2. Destroy key material on disk
+                self._destroy_page_content(cid, i)
+                return (i, page_id, hmac_key, otp_content)
+            return None
+
+    def find_page_by_index(self, index: int, cid: str,
+                           expected_page_id: str = None) -> Optional[Tuple[bytes, bytes]]:
         """
         Look up a page by its numeric index (for decrypting incoming mail).
-        Returns page_content (without page_id prefix) or None.
-        """
-        pages = self._load_pages(cid)
-        used = self._load_used(cid)
+        Returns (hmac_key, otp_content) or None.
 
-        if index < 0 or index >= len(pages):
-            return None
-        if index in used:
-            return None
-        line = pages[index]
-        if len(line.strip()) <= PAGE_ID_LENGTH:
-            return None
-        # 1. Durably mark as used
-        self._mark_used(cid, index)
-        page_content = line[PAGE_ID_LENGTH:]
-        # 2. Destroy key material on disk
-        self._destroy_page_content(cid, index)
-        return page_content
+        If expected_page_id is provided, verifies it matches the stored
+        page ID to detect index manipulation by a compromised server.
+
+        Thread-safe: holds per-contact lock.
+        """
+        lock = self._get_contact_lock(cid)
+        with lock:
+            pages = self._load_pages(cid)
+            used = self._load_used(cid)
+
+            if index < 0 or index >= len(pages):
+                return None
+            if index in used:
+                return None
+
+            parsed = self._parse_page(pages[index])
+            if parsed is None:
+                return None
+
+            page_id, hmac_key, otp_content = parsed
+
+            # Verify page ID if provided (prevents index manipulation)
+            if expected_page_id is not None and page_id != expected_page_id:
+                return None
+
+            # 1. Durably mark as used
+            self._mark_used(cid, index)
+            # 2. Destroy key material on disk
+            self._destroy_page_content(cid, index)
+            return (hmac_key, otp_content)
 
     def generate_pad(self, cid: str, num_pages: int,
                      page_length: int = DEFAULT_PAGE_LENGTH) -> int:
-        """Generate a new pad, REPLACING any existing pad for this contact."""
+        """Generate a new full-entropy byte pad, REPLACING any existing pad."""
+        if not validate_username(cid):
+            raise ValueError(f"Invalid contact ID: {repr(cid)}")
         self.delete_pad(cid)
         pf = self._pad_file(cid)
         with open(pf, 'w', encoding='utf-8') as out:
@@ -609,10 +892,16 @@ class PadManager:
 
     def delete_pad(self, cid: str):
         """Delete all pad data for a contact."""
-        d = self._contact_dir(cid)
+        try:
+            d = self._contact_dir(cid)
+        except ValueError:
+            return
         for fname in ("pad.txt", "role.txt", "used.txt", "cipher.txt"):
             fp = d / fname
             if fp.exists():
+                if fname == "pad.txt":
+                    size = fp.stat().st_size
+                    fp.write_bytes(secrets.token_bytes(size))
                 fp.unlink()
 
     def get_shareable_data(self, cid: str) -> str:
@@ -624,7 +913,10 @@ class PadManager:
 
     def import_shared_pad(self, cid: str, pad_data: str) -> int:
         """Import pad received from contact, REPLACING any existing pad."""
-        pages = [l for l in pad_data.split('\n') if len(l.strip()) > PAGE_ID_LENGTH]
+        if not validate_username(cid):
+            raise ValueError(f"Invalid contact ID: {repr(cid)}")
+        pages = [l for l in pad_data.split('\n')
+                 if len(l.strip()) > PAGE_HEADER_HEX_LEN]
         if not pages:
             return 0
         self.delete_pad(cid)
@@ -636,17 +928,16 @@ class PadManager:
         self._set_role(cid, "recipient")
         return len(pages)
 
-    def _generate_page(self, length: int) -> str:
-        result = []
-        needed = length + PAGE_ID_LENGTH
-        while len(result) < needed:
-            chunk = os.urandom((needed - len(result)) * 4)
-            for b in chunk:
-                if b < OTP_REJECTION_LIMIT:
-                    result.append(OTP_CHARSET[b % OTP_CHARSET_LEN])
-                    if len(result) >= needed:
-                        break
-        return ''.join(result)
+    def _generate_page(self, content_length: int) -> str:
+        """
+        Generate a single pad page as a hex string.
+
+        Layout: PAGE_ID (4 bytes) + HMAC_KEY (32 bytes) + OTP content (content_length bytes)
+        All generated from os.urandom - full 256-value entropy per byte.
+        """
+        total_bytes = (PAGE_ID_HEX_LEN // 2) + HMAC_KEY_BYTES + content_length
+        raw = os.urandom(total_bytes)
+        return raw.hex()
 
     def get_all_contacts(self) -> List[str]:
         if not self.pads_dir.exists():
@@ -709,7 +1000,6 @@ class MessageStore:
             self.vault.encrypt_and_store(filename, d)
 
     def toggle_favourite(self, filename) -> bool:
-        """Toggle favourite flag. Returns the new state."""
         d = self.vault.load_and_decrypt(filename)
         if d:
             d['favourite'] = not d.get('favourite', False)
@@ -727,7 +1017,6 @@ class MessageStore:
             for fn in self.vault.list_files(prefix):
                 d = self.vault.load_and_decrypt(fn)
                 if d:
-                    # Never purge favourited messages
                     if d.get('favourite', False):
                         continue
                     try:

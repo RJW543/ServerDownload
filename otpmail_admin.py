@@ -1,33 +1,109 @@
 #!/usr/bin/env python3
 """
-OTPMail Server Administration Tool
+OTPMail Admin Tool — Requires OTPMAIL_ADMIN_PASSPHRASE to run.
 
-Run from the OTPMail directory on the VPS (same dir as otpmail_server.py).
+Manages users, mailboxes, bans, and server status.
+Passphrase is checked via PBKDF2-hashed token stored on first run.
 
 Usage:
-    python3 otpmail_admin.py users                  List all registered users
-    python3 otpmail_admin.py info <username>         Show details for a user
-    python3 otpmail_admin.py remove <username>       Unregister user + delete mailbox
-    python3 otpmail_admin.py kick <username>         Unregister user (keeps mailbox)
-    python3 otpmail_admin.py mailbox <username>      Show pending messages
-    python3 otpmail_admin.py purge <username>        Delete all pending messages
+    export OTPMAIL_ADMIN_PASSPHRASE='your-admin-passphrase'
+    python3 otpmail_admin.py <command> [args...]
 
-    python3 otpmail_admin.py ban <ip>                Ban an IP address
-    python3 otpmail_admin.py unban <ip>              Remove an IP ban
-    python3 otpmail_admin.py bans                    List all banned IPs
-
-    python3 otpmail_admin.py status                  Server summary
+Commands:
+    users                 List registered users
+    info    <username>    Details on a specific user
+    remove  <username>    Delete registration + mailbox (requires confirmation)
+    kick    <username>    Wipe keys so user must re-register (keeps mailbox)
+    ban     <ip>          Ban an IP address
+    unban   <ip>          Remove an IP ban
+    bans                  List all banned IPs
+    mailbox <username>    View pending messages (metadata only)
+    purge   <username>    Delete all pending messages
+    status                Overall server summary
 """
 
+import os
 import sys
 import json
-import shutil
+import hmac
+import secrets
+import hashlib
 from pathlib import Path
+from datetime import datetime
+
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+
+# ============================================================
+#  PATHS (must match otpmail_server.py)
+# ============================================================
 
 KEYSTORE_FILE = Path("server_keystore.json")
 MAILBOX_DIR = Path("server_mailboxes")
 BANLIST_FILE = Path("banned_ips.txt")
+ADMIN_HASH_FILE = Path(".admin_passphrase_hash")
 
+MIN_ADMIN_PASSPHRASE = 12
+
+# ============================================================
+#  PASSPHRASE AUTHENTICATION
+# ============================================================
+
+def _derive_admin_hash(passphrase: str, salt: bytes) -> bytes:
+    """Derive a verification hash from the admin passphrase."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32,
+        salt=salt, iterations=480_000,
+    )
+    return kdf.derive(passphrase.encode('utf-8'))
+
+
+def _verify_passphrase(passphrase: str) -> bool:
+    """
+    Verify admin passphrase against stored hash.
+    On first run, stores the hash for future verification.
+    """
+    if not passphrase or len(passphrase) < MIN_ADMIN_PASSPHRASE:
+        return False
+
+    if ADMIN_HASH_FILE.exists():
+        # Verify against stored hash
+        blob = ADMIN_HASH_FILE.read_bytes()
+        if len(blob) < 16:
+            return False
+        salt = blob[:16]
+        stored_hash = blob[16:]
+        computed = _derive_admin_hash(passphrase, salt)
+        return hmac.compare_digest(computed, stored_hash)
+    else:
+        # First run — store the hash
+        salt = secrets.token_bytes(16)
+        hash_val = _derive_admin_hash(passphrase, salt)
+        ADMIN_HASH_FILE.write_bytes(salt + hash_val)
+        os.chmod(str(ADMIN_HASH_FILE), 0o600)
+        print(f"Admin passphrase hash stored in {ADMIN_HASH_FILE}")
+        print("Keep OTPMAIL_ADMIN_PASSPHRASE consistent across sessions.")
+        return True
+
+
+def require_auth():
+    """Check passphrase from environment. Exit on failure."""
+    passphrase = os.environ.get("OTPMAIL_ADMIN_PASSPHRASE", "")
+    if not passphrase:
+        print("ERROR: OTPMAIL_ADMIN_PASSPHRASE environment variable is not set.")
+        print("Set it with:  export OTPMAIL_ADMIN_PASSPHRASE='your-admin-passphrase'")
+        sys.exit(1)
+    if len(passphrase) < MIN_ADMIN_PASSPHRASE:
+        print(f"ERROR: Passphrase must be at least {MIN_ADMIN_PASSPHRASE} characters.")
+        sys.exit(1)
+    if not _verify_passphrase(passphrase):
+        print("ERROR: Incorrect admin passphrase.")
+        sys.exit(1)
+
+
+# ============================================================
+#  DATA ACCESS
+# ============================================================
 
 def load_keystore() -> dict:
     if KEYSTORE_FILE.exists():
@@ -36,211 +112,236 @@ def load_keystore() -> dict:
     return {}
 
 
-def save_keystore(data: dict):
-    with open(KEYSTORE_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+def save_keystore(keys: dict):
+    tmp = KEYSTORE_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(keys, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(str(tmp), str(KEYSTORE_FILE))
 
 
 def load_bans() -> set:
-    if BANLIST_FILE.exists():
-        return set(line.strip() for line in BANLIST_FILE.read_text().splitlines() if line.strip())
-    return set()
+    if not BANLIST_FILE.exists():
+        return set()
+    return set(
+        line.strip() for line in BANLIST_FILE.read_text().splitlines()
+        if line.strip())
 
 
-def save_bans(bans: set):
-    BANLIST_FILE.write_text('\n'.join(sorted(bans)) + '\n')
+def save_bans(banned: set):
+    tmp = BANLIST_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        f.write('\n'.join(sorted(banned)) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(str(tmp), str(BANLIST_FILE))
 
 
-def mailbox_count(username: str) -> int:
-    d = MAILBOX_DIR / username
-    if d.exists():
-        return len(list(d.glob("*.json")))
-    return 0
+def user_mailbox_dir(username: str) -> Path:
+    return MAILBOX_DIR / username
 
 
-# ---- Commands ----
-
-def cmd_users():
-    ks = load_keystore()
-    if not ks:
-        print("No registered users.")
-        return
-    print(f"{'Username':<20} {'Registered':<22} {'Pending':<10} {'Ed25519 (short)'}")
-    print("-" * 76)
-    for name, info in sorted(ks.items()):
-        reg = info.get('registered', '?')[:19]
-        pending = mailbox_count(name)
-        ed_short = info.get('ed25519', '?')[:16] + '...'
-        print(f"{name:<20} {reg:<22} {pending:<10} {ed_short}")
-    print(f"\nTotal: {len(ks)} users")
+def count_mailbox(username: str) -> int:
+    d = user_mailbox_dir(username)
+    if not d.exists():
+        return 0
+    return len(list(d.glob("*.json")))
 
 
-def cmd_info(username: str):
-    ks = load_keystore()
-    if username not in ks:
-        print(f"User '{username}' not found.")
-        return
-    info = ks[username]
-    print(f"Username:      {username}")
-    print(f"Registered:    {info.get('registered', '?')}")
-    print(f"Ed25519 pub:   {info.get('ed25519', '?')}")
-    print(f"X25519 pub:    {info.get('x25519', '?')}")
-    print(f"Pending mail:  {mailbox_count(username)}")
-
-
-def cmd_remove(username: str):
-    ks = load_keystore()
-    if username not in ks:
-        print(f"User '{username}' not found.")
-        return
-    confirm = input(f"Remove '{username}' and delete their mailbox? (yes/no): ").strip().lower()
-    if confirm != 'yes':
-        print("Cancelled.")
-        return
-    del ks[username]
-    save_keystore(ks)
-    mb = MAILBOX_DIR / username
-    if mb.exists():
-        shutil.rmtree(mb)
-        print(f"Deleted mailbox for '{username}'.")
-    print(f"User '{username}' removed. They will need to re-register with new keys.")
-
-
-def cmd_kick(username: str):
-    ks = load_keystore()
-    if username not in ks:
-        print(f"User '{username}' not found.")
-        return
-    del ks[username]
-    save_keystore(ks)
-    print(f"User '{username}' unregistered. Keys wiped — they can re-register on next connect.")
-
-
-def cmd_mailbox(username: str):
-    d = MAILBOX_DIR / username
-    if not d.exists() or not list(d.glob("*.json")):
-        print(f"No pending messages for '{username}'.")
-        return
+def list_mailbox(username: str) -> list:
+    d = user_mailbox_dir(username)
+    if not d.exists():
+        return []
+    msgs = []
     for fp in sorted(d.glob("*.json")):
         try:
             with open(fp, 'r') as f:
                 m = json.load(f)
-            mtype = m.get('type', 'mail')
-            sender = m.get('from', '?')
-            ts = m.get('timestamp', '?')[:19]
-            mid = m.get('id', '?')
-            print(f"  [{mid}] {mtype:<5} from {sender:<15} at {ts}")
+                msgs.append(m)
         except Exception:
-            print(f"  [ERROR] {fp.name}")
-    print(f"\nTotal: {mailbox_count(username)} pending")
+            pass
+    return msgs
 
 
-def cmd_purge(username: str):
-    d = MAILBOX_DIR / username
-    if not d.exists():
-        print(f"No mailbox for '{username}'.")
+# ============================================================
+#  COMMANDS
+# ============================================================
+
+def cmd_users():
+    keys = load_keystore()
+    if not keys:
+        print("No registered users.")
         return
-    count = len(list(d.glob("*.json")))
-    if count == 0:
-        print("Mailbox already empty.")
+    print(f"{'Username':<20} {'Registered':<22} {'Pending':<8}")
+    print("-" * 52)
+    for username, data in sorted(keys.items()):
+        reg = data.get('registered', '?')[:19]
+        pending = count_mailbox(username)
+        print(f"{username:<20} {reg:<22} {pending:<8}")
+    print(f"\nTotal: {len(keys)} users")
+
+
+def cmd_info(username: str):
+    keys = load_keystore()
+    if username not in keys:
+        print(f"User '{username}' not found.")
         return
-    confirm = input(f"Delete {count} pending messages for '{username}'? (yes/no): ").strip().lower()
-    if confirm != 'yes':
+    data = keys[username]
+    print(f"Username:    {username}")
+    print(f"Registered:  {data.get('registered', '?')}")
+    print(f"Ed25519 pub: {data.get('ed25519', '?')[:16]}...")
+    print(f"X25519 pub:  {data.get('x25519', '?')[:16]}...")
+    print(f"Pending:     {count_mailbox(username)} messages")
+
+
+def cmd_remove(username: str):
+    keys = load_keystore()
+    if username not in keys:
+        print(f"User '{username}' not found.")
+        return
+    confirm = input(f"Remove user '{username}' and all data? [y/N]: ").strip().lower()
+    if confirm != 'y':
         print("Cancelled.")
         return
-    for fp in d.glob("*.json"):
-        fp.unlink()
-    print(f"Purged {count} messages.")
+    del keys[username]
+    save_keystore(keys)
+    # Remove mailbox
+    d = user_mailbox_dir(username)
+    if d.exists():
+        import shutil
+        shutil.rmtree(d)
+    print(f"Removed user '{username}'.")
+
+
+def cmd_kick(username: str):
+    keys = load_keystore()
+    if username not in keys:
+        print(f"User '{username}' not found.")
+        return
+    confirm = input(
+        f"Kick '{username}'? This wipes their keys so they must re-register. "
+        f"Mailbox is kept. [y/N]: ").strip().lower()
+    if confirm != 'y':
+        print("Cancelled.")
+        return
+    del keys[username]
+    save_keystore(keys)
+    print(f"Kicked '{username}'. They must re-register on next connect.")
 
 
 def cmd_ban(ip: str):
-    bans = load_bans()
-    if ip in bans:
-        print(f"{ip} is already banned.")
-        return
-    bans.add(ip)
-    save_bans(bans)
-    print(f"Banned {ip}.")
-    print("Takes effect on next connection attempt (no server restart needed).")
-    print("To drop an active connection immediately: systemctl restart otpmail")
+    banned = load_bans()
+    banned.add(ip)
+    save_bans(banned)
+    print(f"Banned {ip}. Takes effect on next connection attempt.")
 
 
 def cmd_unban(ip: str):
-    bans = load_bans()
-    if ip not in bans:
+    banned = load_bans()
+    if ip not in banned:
         print(f"{ip} is not banned.")
         return
-    bans.discard(ip)
-    save_bans(bans)
+    banned.discard(ip)
+    save_bans(banned)
     print(f"Unbanned {ip}.")
 
 
 def cmd_bans():
-    bans = load_bans()
-    if not bans:
+    banned = load_bans()
+    if not banned:
         print("No banned IPs.")
         return
-    print("Banned IPs:")
-    for ip in sorted(bans):
+    print(f"Banned IPs ({len(banned)}):")
+    for ip in sorted(banned):
         print(f"  {ip}")
-    print(f"\nTotal: {len(bans)}")
+
+
+def cmd_mailbox(username: str):
+    msgs = list_mailbox(username)
+    if not msgs:
+        print(f"No pending messages for '{username}'.")
+        return
+    print(f"Pending messages for '{username}' ({len(msgs)}):")
+    print(f"  {'ID':<14} {'Type':<6} {'From':<20} {'Timestamp':<22}")
+    print("  " + "-" * 64)
+    for m in msgs:
+        print(f"  {m.get('id', '?'):<14} {m.get('type', 'mail'):<6} "
+              f"{m.get('from', '?'):<20} {m.get('timestamp', '?')[:19]:<22}")
+
+
+def cmd_purge(username: str):
+    msgs = list_mailbox(username)
+    if not msgs:
+        print(f"No pending messages for '{username}'.")
+        return
+    confirm = input(
+        f"Purge {len(msgs)} messages from '{username}'s mailbox? [y/N]: "
+    ).strip().lower()
+    if confirm != 'y':
+        print("Cancelled.")
+        return
+    d = user_mailbox_dir(username)
+    purged = 0
+    for fp in d.glob("*.json"):
+        fp.unlink()
+        purged += 1
+    print(f"Purged {purged} messages.")
 
 
 def cmd_status():
-    ks = load_keystore()
-    bans = load_bans()
+    keys = load_keystore()
+    banned = load_bans()
     total_pending = 0
     if MAILBOX_DIR.exists():
         for d in MAILBOX_DIR.iterdir():
             if d.is_dir():
                 total_pending += len(list(d.glob("*.json")))
-
-    print("=== OTPMail Server Status ===")
-    print(f"Registered users:  {len(ks)}")
+    print("OTPMail Server Status")
+    print("-" * 30)
+    print(f"Registered users:  {len(keys)}")
     print(f"Pending messages:  {total_pending}")
-    print(f"Banned IPs:        {len(bans)}")
-    print(f"Keystore:          {KEYSTORE_FILE} ({'exists' if KEYSTORE_FILE.exists() else 'missing'})")
-    print(f"Mailbox dir:       {MAILBOX_DIR} ({'exists' if MAILBOX_DIR.exists() else 'missing'})")
-    print(f"Ban list:          {BANLIST_FILE} ({'exists' if BANLIST_FILE.exists() else 'not created yet'})")
-
-    id_file = Path("server_identity_ed25519.pem")
-    print(f"Server identity:   {id_file} ({'present' if id_file.exists() else 'NOT FOUND'})")
+    print(f"Banned IPs:        {len(banned)}")
+    print(f"Keystore:          {'exists' if KEYSTORE_FILE.exists() else 'missing'}")
+    print(f"Mailbox dir:       {'exists' if MAILBOX_DIR.exists() else 'missing'}")
 
 
-# ---- Main ----
+# ============================================================
+#  MAIN
+# ============================================================
+
+COMMANDS = {
+    'users':   (cmd_users, 0),
+    'info':    (cmd_info, 1),
+    'remove':  (cmd_remove, 1),
+    'kick':    (cmd_kick, 1),
+    'ban':     (cmd_ban, 1),
+    'unban':   (cmd_unban, 1),
+    'bans':    (cmd_bans, 0),
+    'mailbox': (cmd_mailbox, 1),
+    'purge':   (cmd_purge, 1),
+    'status':  (cmd_status, 0),
+}
+
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print("Usage: python3 otpmail_admin.py <command> [args...]")
+        print(f"Commands: {', '.join(sorted(COMMANDS.keys()))}")
+        sys.exit(1)
 
-    cmd = sys.argv[1].lower()
-    arg = sys.argv[2] if len(sys.argv) >= 3 else None
+    # Authenticate before any operation
+    require_auth()
 
-    commands = {
-        'users':   (False, lambda: cmd_users()),
-        'status':  (False, lambda: cmd_status()),
-        'bans':    (False, lambda: cmd_bans()),
-        'info':    (True,  lambda: cmd_info(arg)),
-        'remove':  (True,  lambda: cmd_remove(arg)),
-        'kick':    (True,  lambda: cmd_kick(arg)),
-        'mailbox': (True,  lambda: cmd_mailbox(arg)),
-        'purge':   (True,  lambda: cmd_purge(arg)),
-        'ban':     (True,  lambda: cmd_ban(arg)),
-        'unban':   (True,  lambda: cmd_unban(arg)),
-    }
+    cmd_name = sys.argv[1]
+    func, nargs = COMMANDS[cmd_name]
 
-    if cmd not in commands:
-        print(f"Unknown command: {cmd}")
-        print(__doc__)
-        return
+    if nargs > 0 and len(sys.argv) < 2 + nargs:
+        print(f"'{cmd_name}' requires {nargs} argument(s).")
+        sys.exit(1)
 
-    needs_arg, fn = commands[cmd]
-    if needs_arg and not arg:
-        print(f"Usage: python3 otpmail_admin.py {cmd} <argument>")
-        return
-
-    fn()
+    args = sys.argv[2:2 + nargs]
+    func(*args)
 
 
 if __name__ == "__main__":
