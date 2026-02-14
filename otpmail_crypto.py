@@ -565,14 +565,11 @@ class EncryptedVault:
         target = self.vault_dir / filename
         tmp = target.with_suffix('.tmp')
         with self._lock:
-            tmp.write_bytes(nonce + ct)
-            # fsync the temp file to ensure durability before rename
-            fd = os.open(str(tmp), os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.rename(str(tmp), str(target))
+            with open(tmp, 'wb') as f:
+                f.write(nonce + ct)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(target))
 
     def load_and_decrypt(self, filename: str) -> Optional[dict]:
         filename = self._safe_filename(filename)
@@ -678,13 +675,11 @@ class PadManager:
         else:
             blob = data
         tmp = filepath.with_suffix('.tmp')
-        tmp.write_bytes(blob)
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.rename(str(tmp), str(filepath))
+        with open(tmp, 'wb') as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(filepath))
 
     def _read_decrypted(self, filepath: Path) -> bytes:
         """Read file and decrypt. Returns plaintext bytes."""
